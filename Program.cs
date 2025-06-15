@@ -5,12 +5,15 @@ using Telegram.Bot.Types.Enums;
 using Telegram.Bot.Types.ReplyMarkups;
 using Microsoft.Data.Sqlite;
 using DotNetEnv;
+using System.Text;
 
 namespace ShopBonusBot
 {
     class Program
     {
         private static readonly QrCodeService _qrService = new();
+        internal static readonly int BonusPercentage = 12; // 12% от суммы покупки
+        public static string ApiBaseUrl = Environment.GetEnvironmentVariable("API_BASE_URL")!;
         private static Timer? _cleanupTimer;
         private static readonly Dictionary<long, string> _userStates = new();
         static async Task Main()
@@ -34,12 +37,18 @@ namespace ShopBonusBot
             );
 
             InitializeDatabase();
-            
-            _cleanupTimer = new Timer(_ => 
+
+            _cleanupTimer = new Timer(_ =>
             {
                 _qrService.CleanupExpiredTokens();
                 Console.WriteLine("Выполнена очистка просроченных QR-токенов");
             }, null, TimeSpan.Zero, TimeSpan.FromHours(1));
+
+            if (string.IsNullOrEmpty(ApiBaseUrl))
+            {
+                Console.WriteLine("API_BASE_URL is not configured");
+                Environment.Exit(1);
+            }
 
             Console.WriteLine("Bot started. Press Enter to stop");
             await Task.Run(Console.ReadLine, cts.Token);
@@ -72,12 +81,12 @@ namespace ShopBonusBot
                 FOREIGN KEY (UserId) REFERENCES Users(id)
             );";
 
-                // Обновляем таблицу Users
+            // Обновляем таблицу Users
             var alterTableCommand = @"
             ALTER TABLE Users 
             ADD COLUMN LastQrToken TEXT;
             ";
-    
+
             try
             {
                 using var command = new SqliteCommand(alterTableCommand, connection);
@@ -88,7 +97,7 @@ namespace ShopBonusBot
                 // Игнорируем ошибку "column already exists"
                 Console.WriteLine("Columns already exist, skipping alter");
             }
-            
+
 
             using (var command = new SqliteCommand(createUsersTable, connection))
             {
@@ -166,12 +175,11 @@ namespace ShopBonusBot
                 }
                 else if (messageText == "🛒 Оплатить бонусами")
                 {
-                    await StartBonusPayment(botClient, chatId, conn, cancellationToken);
-                    _userStates[chatId] = "awaiting_purchase_amount";
+                    await GenerateAndSendPaymentQrCode(botClient, chatId, cancellationToken);
                 }
                 else if (messageText == "💳 Виртуальная карта")
                 {
-                     await GenerateAndSendQrCode(botClient, chatId, cancellationToken);      
+                    await GenerateAndSendQrCode(botClient, chatId, cancellationToken);
                 }
             }
             catch (Exception ex)
@@ -179,22 +187,90 @@ namespace ShopBonusBot
                 await botClient.SendMessage(chatId, $"Ошибка: {ex.Message}", cancellationToken: cancellationToken);
             }
         }
-
-        private static async Task GenerateAndSendQrCode(
-            ITelegramBotClient botClient, 
-            long chatId, 
+        
+        private static async Task GenerateAndSendPaymentQrCode(
+            ITelegramBotClient botClient,
+            long chatId,
             CancellationToken cancellationToken)
         {
             try
             {
-                var (qrStream, expiry) = _qrService.GenerateQrCode(chatId);
+                using var conn = new SqliteConnection("Data Source=database/shopbonus.db");
+                await conn.OpenAsync(cancellationToken);
+                
+                // Проверяем регистрацию пользователя
+                var user = await GetUserInfo(chatId, conn, cancellationToken);
+                if (user == null)
+                {
+                    await botClient.SendMessage(
+                        chatId,
+                        "❌ Вы не зарегистрированы! Пожалуйста, пройдите регистрацию сначала.",
+                        cancellationToken: cancellationToken);
+                    return;
+                }
+
+                // Проверяем баланс
+                if (user.Balance <= 0)
+                {
+                    await botClient.SendMessage(
+                        chatId,
+                        "❌ У вас недостаточно бонусов для оплаты!",
+                        cancellationToken: cancellationToken);
+                    return;
+                }
+
+                // Генерируем QR-код для оплаты
+                var (qrStream, token, expiry) = _qrService.GeneratePaymentQrCode(chatId, user.Balance);
                 
                 await botClient.SendPhoto(
                     chatId: chatId,
-                    photo: InputFile.FromStream(qrStream, "qrcode.png"),
-                    caption: $"Ваша виртуальная карта\nДействует 10 минут.\nПокажите продавцу QR-код ",
+                    photo: InputFile.FromStream(qrStream, "payment_qr.png"),
+                    caption: $"💳 QR-код для оплаты бонусами\n" +
+                            $"Доступно: {user.Balance} бонусов\n" +
+                            $"Действует до: {expiry:HH:mm}\n" +
+                            "Покажите этот код кассиру для применения скидки",
                     cancellationToken: cancellationToken);
                 
+                qrStream.Dispose();
+            }
+            catch (Exception ex)
+            {
+                await botClient.SendMessage(
+                    chatId,
+                    $"❌ Ошибка при генерации QR-кода: {ex.Message}",
+                    cancellationToken: cancellationToken);
+            }
+        }
+
+        private static async Task GenerateAndSendQrCode(
+            ITelegramBotClient botClient,
+            long chatId,
+            CancellationToken cancellationToken)
+        {
+            try
+            {
+                // Проверяем регистрацию пользователя
+                bool isRegistered = await IsUserRegistered(chatId, cancellationToken);
+
+                if (!isRegistered)
+                {
+                    await botClient.SendMessage(
+                        chatId,
+                        "❌ Вы не зарегистрированы!\n" +
+                        "Пожалуйста, пройдите регистрацию сначала с помощью команды /start",
+                        cancellationToken: cancellationToken);
+                    return;
+                }
+
+                // Генерируем и отправляем QR-код
+                var (qrStream, token, expiry) = _qrService.GenerateQrCode(chatId);
+
+                await botClient.SendPhoto(
+                    chatId: chatId,
+                    photo: InputFile.FromStream(qrStream, "qrcode.png"),
+                    caption: $"Ваша виртуальная карта\nДействует до: {expiry:HH:mm}\nПокажите продавцу QR-код",
+                    cancellationToken: cancellationToken);
+
                 qrStream.Dispose();
             }
             catch (Exception ex)
@@ -204,6 +280,71 @@ namespace ShopBonusBot
                     $"❌ Ошибка генерации QR-кода: {ex.Message}",
                     cancellationToken: cancellationToken);
             }
+        }
+        
+        private static async Task<UserInfo?> GetUserInfo(long chatId, CancellationToken ct)
+        {
+            using var conn = new SqliteConnection("Data Source=database/shopbonus.db");
+            await conn.OpenAsync(ct);
+            
+            const string query = "SELECT id, Phone, BonusBalance FROM Users WHERE ChatId = @chatId LIMIT 1";
+            
+            using var cmd = new SqliteCommand(query, conn);
+            cmd.Parameters.AddWithValue("@chatId", chatId);
+            
+            using var reader = await cmd.ExecuteReaderAsync(ct);
+            if (await reader.ReadAsync(ct))
+            {
+                return new UserInfo(
+                    reader.GetInt64(0),
+                    reader.GetString(1),
+                    reader.GetInt32(2)
+                );
+            }
+            
+            return null;
+        }
+
+        private static async Task<UserInfo?> GetUserInfo(
+            long chatId, 
+            SqliteConnection conn, 
+            CancellationToken ct)
+        {
+            const string query = "SELECT id, Phone, BonusBalance FROM Users WHERE ChatId = @chatId LIMIT 1";
+            
+            using var cmd = new SqliteCommand(query, conn);
+            cmd.Parameters.AddWithValue("@chatId", chatId);
+            
+            using var reader = await cmd.ExecuteReaderAsync(ct);
+            if (await reader.ReadAsync(ct))
+            {
+                return new UserInfo(
+                    reader.GetInt64(0),
+                    reader.GetString(1),
+                    reader.GetInt32(2)
+                );
+            }
+            
+            return null;
+        }
+
+
+
+
+
+        // Проверка регистрации пользователя
+        private static async Task<bool> IsUserRegistered(long chatId, CancellationToken ct)
+        {
+            using var conn = new SqliteConnection("Data Source=database/shopbonus.db");
+            await conn.OpenAsync(ct);
+
+            const string query = "SELECT 1 FROM Users WHERE ChatId = @chatId LIMIT 1";
+
+            using var cmd = new SqliteCommand(query, conn);
+            cmd.Parameters.AddWithValue("@chatId", chatId);
+
+            var result = await cmd.ExecuteScalarAsync(ct);
+            return result != null;
         }
 
         private static async Task HandleStartCommand(ITelegramBotClient botClient, long chatId, CancellationToken cancellationToken)
@@ -247,37 +388,104 @@ namespace ShopBonusBot
             SqliteConnection conn,
             CancellationToken cancellationToken)
         {
-            // Если пользователь отправил контакт
-            if ((phone.StartsWith("8") && phone.Length == 11) || (phone.StartsWith("+7") && phone.Length == 12))
+            // Нормализация номера телефона
+            string normalizedPhone = NormalizePhoneNumber(phone);
+
+            // Валидация номера
+            if (!IsValidRussianPhoneNumber(normalizedPhone))
             {
-                phone = phone.Trim();
-            }
-            else
-            {
-                await botClient.SendMessage(chatId, "❌ Некорректный номер телефона", cancellationToken: cancellationToken);
+                await botClient.SendMessage(
+                    chatId,
+                    "❌ Некорректный номер телефона. Введите номер в формате: 79XXXXXXXXX, +79XXXXXXXXX или 89XXXXXXXXX",
+                    cancellationToken: cancellationToken);
                 return;
             }
 
-            // Проверяем, есть ли уже такой пользователь
+            // Проверка существующего пользователя
             using var checkCmd = new SqliteCommand("SELECT COUNT(*) FROM Users WHERE ChatId = @chatId", conn);
             checkCmd.Parameters.AddWithValue("@chatId", chatId);
             var count = Convert.ToInt32(await checkCmd.ExecuteScalarAsync(cancellationToken));
 
             if (count > 0)
             {
-                await botClient.SendMessage(chatId, "⚠️ Вы уже зарегистрированы!", cancellationToken: cancellationToken);
+                await botClient.SendMessage(
+                    chatId,
+                    "⚠️ Вы уже зарегистрированы!",
+                    cancellationToken: cancellationToken);
                 return;
             }
 
-            // Вставляем нового пользователя
+            // Регистрация нового пользователя
             using var cmd = new SqliteCommand(
-                "INSERT INTO Users (ChatId, Phone, BonusBalance, RegistrationDate) VALUES (@chatId, @phone, 1000, date('now'))",
+                "INSERT INTO Users (ChatId, Phone, BonusBalance, RegistrationDate) " +
+                "VALUES (@chatId, @phone, 1000, date('now'))",
                 conn);
             cmd.Parameters.AddWithValue("@chatId", chatId);
-            cmd.Parameters.AddWithValue("@phone", phone);
+            cmd.Parameters.AddWithValue("@phone", normalizedPhone);
             await cmd.ExecuteNonQueryAsync(cancellationToken);
 
-            await botClient.SendMessage(chatId, "✅ Вы успешно зарегистрировались!", cancellationToken: cancellationToken);
+            await botClient.SendMessage(
+                chatId,
+                "✅ Вы успешно зарегистрировались!\n" +
+                $"Ваш номер: {FormatPhoneNumber(normalizedPhone)}",
+                cancellationToken: cancellationToken);
+        }
+
+
+        // Метод для нормализации номера телефона
+        private static string NormalizePhoneNumber(string phone)
+        {
+            // Удаляем все нецифровые символы, кроме возможного '+' в начале
+            var digits = new StringBuilder();
+            foreach (char c in phone)
+            {
+                if (char.IsDigit(c) || (c == '+' && digits.Length == 0))
+                {
+                    digits.Append(c);
+                }
+            }
+            string normalized = digits.ToString();
+
+            // Заменяем 8 на +7 в начале номера
+            if (normalized.StartsWith("8") && normalized.Length > 1)
+            {
+                normalized = "+7" + normalized.Substring(1);
+            }
+            // Добавляем +7 если номер начинается с 9 и имеет 10 цифр
+            else if (normalized.StartsWith("9") && normalized.Length == 10)
+            {
+                normalized = "+7" + normalized;
+            }
+            // Добавляем + если его нет и номер начинается с 7
+            else if (normalized.StartsWith("7") && normalized.Length == 11 && !normalized.StartsWith("+"))
+            {
+                normalized = "+" + normalized;
+            }
+
+            return normalized;
+        }
+
+        // Метод для проверки валидности российского номера
+        private static bool IsValidRussianPhoneNumber(string phone)
+        {
+            // Номер должен быть в формате +79XXXXXXXXX (11 цифр с кодом страны)
+            if (phone.Length != 12 || !phone.StartsWith("+79"))
+            {
+                return false;
+            }
+
+            // Проверяем что остальные символы - цифры
+            return phone.Substring(1).All(char.IsDigit);
+        }
+
+        // Метод для красивого форматирования номера
+        private static string FormatPhoneNumber(string phone)
+        {
+            if (phone.StartsWith("+7") && phone.Length == 12)
+            {
+                return $"+7 ({phone.Substring(2, 3)}) {phone.Substring(5, 3)}-{phone.Substring(8, 2)}-{phone.Substring(10)}";
+            }
+            return phone; // Возвращаем как есть, если формат не распознан
         }
 
         private static async Task ShowMainMenu(ITelegramBotClient botClient, long chatId, CancellationToken cancellationToken)
@@ -306,7 +514,7 @@ namespace ShopBonusBot
             using var cmd = new SqliteCommand("SELECT BonusBalance FROM Users WHERE ChatId = @chatId", conn);
             cmd.Parameters.AddWithValue("@chatId", chatId);
             var balance = await cmd.ExecuteScalarAsync(cancellationToken) as long?;
-            
+
             if (balance.HasValue)
             {
                 await botClient.SendMessage(
@@ -332,19 +540,19 @@ namespace ShopBonusBot
             using var cmd = new SqliteCommand("SELECT BonusBalance FROM Users WHERE ChatId = @chatId", conn);
             cmd.Parameters.AddWithValue("@chatId", chatId);
             var balance = await cmd.ExecuteScalarAsync(cancellationToken) as long?;
-            
+
             if (!balance.HasValue)
             {
                 await botClient.SendMessage(chatId, "❌ Вы не зарегистрированы", cancellationToken: cancellationToken);
                 return;
             }
-            
+
             if (balance == 0)
             {
                 await botClient.SendMessage(chatId, "❌ У вас нет бонусов для оплаты", cancellationToken: cancellationToken);
                 return;
             }
-            
+
             await botClient.SendMessage(
                 chatId,
                 $"💳 Введите сумму покупки (доступно: {balance} бонусов)\n" +
@@ -352,7 +560,6 @@ namespace ShopBonusBot
                 replyMarkup: new ReplyKeyboardRemove(),
                 cancellationToken: cancellationToken);
         }
-
         private static async Task ProcessBonusPayment(
             ITelegramBotClient botClient,
             long chatId,
@@ -360,91 +567,215 @@ namespace ShopBonusBot
             SqliteConnection conn,
             CancellationToken cancellationToken)
         {
-            // Проверка корректности суммы
+            // Проверка корректности суммы покупки
             if (purchaseAmount <= 0)
             {
-                await botClient.SendMessage(
-                    chatId,
+                await SendErrorMessage(botClient, chatId,
                     "❌ Сумма покупки должна быть больше нуля",
-                    cancellationToken: cancellationToken);
+                    cancellationToken);
                 return;
             }
 
-            var transaction = (SqliteTransaction?)await conn.BeginTransactionAsync(cancellationToken);
+            await using var transaction = (SqliteTransaction)await conn.BeginTransactionAsync(cancellationToken);
+
             try
             {
-                // Получаем баланс с блокировкой строки
-                var balanceCmd = new SqliteCommand("SELECT BonusBalance FROM Users WHERE ChatId = @chatId", conn, transaction);
-                balanceCmd.Parameters.AddWithValue("@chatId", chatId);
-                var balanceObj = await balanceCmd.ExecuteScalarAsync(cancellationToken);
-                
-                if (balanceObj == null)
+                // 1. Получаем данные пользователя с блокировкой строки
+                var user = await GetUserWithLock(conn, chatId, transaction, cancellationToken);
+
+                if (user == null)
                 {
-                    await botClient.SendMessage(chatId, "❌ Вы не зарегистрированы", cancellationToken: cancellationToken);
+                    await SendErrorMessage(botClient, chatId,
+                        "❌ Вы не зарегистрированы",
+                        cancellationToken);
                     return;
                 }
-                
-                long balance = Convert.ToInt64(balanceObj);
-                
-                // Рассчитываем максимальную скидку
-                long maxBonus = Math.Min(balance, purchaseAmount / 2);
-                
-                if (maxBonus <= 0)
+
+                // 2. Проверяем достаточность бонусов
+                if (user.BonusBalance <= 0)
                 {
-                    await botClient.SendMessage(
-                        chatId,
+                    await SendErrorMessage(botClient, chatId,
+                        "❌ У вас нет бонусов для оплаты",
+                        cancellationToken);
+                    return;
+                }
+
+                // 3. Рассчитываем доступные бонусы
+                var bonusCalculation = CalculateAvailableBonus(user.BonusBalance, purchaseAmount);
+
+                if (!bonusCalculation.CanUseBonus)
+                {
+                    await SendErrorMessage(botClient, chatId,
                         $"❌ Недостаточно бонусов для оплаты\n" +
-                        $"Минимальная сумма покупки для использования бонусов: {balance * 2 + 1} руб.",
-                        cancellationToken: cancellationToken);
+                        $"Минимальная сумма покупки для использования бонусов: {bonusCalculation.MinPurchaseAmount} руб.",
+                        cancellationToken);
                     return;
                 }
 
-                // Обновляем баланс
-                var updateCmd = new SqliteCommand(
-                    "UPDATE Users SET BonusBalance = BonusBalance - @bonus WHERE ChatId = @chatId",
-                    conn, transaction);
-                updateCmd.Parameters.AddWithValue("@bonus", maxBonus);
-                updateCmd.Parameters.AddWithValue("@chatId", chatId);
-                int updated = await updateCmd.ExecuteNonQueryAsync(cancellationToken);
-                
-                if (updated == 0)
-                {
-                    await botClient.SendMessage(chatId, "❌ Ошибка при списании бонусов", cancellationToken: cancellationToken);
-                    await transaction.RollbackAsync(CancellationToken.None);
-                    return;
-                }
+                // 4. Обновляем баланс
+                var newBalance = await UpdateUserBalance(
+                    conn, transaction,
+                    user.Id, bonusCalculation.BonusToUse,
+                    cancellationToken);
 
-                // Фиксируем транзакцию
-                var transCmd = new SqliteCommand(
-                    "INSERT INTO Transactions (UserId, Type, Amount, Date) " +
-                    "SELECT id, 'WriteOff', @amount, date('now') FROM Users WHERE ChatId = @chatId",
-                    conn, transaction);
-                transCmd.Parameters.AddWithValue("@amount", maxBonus);
-                transCmd.Parameters.AddWithValue("@chatId", chatId);
-                await transCmd.ExecuteNonQueryAsync(cancellationToken);
+                // 5. Записываем транзакцию
+                await RecordTransaction(
+                    conn, transaction,
+                    user.Id, bonusCalculation.BonusToUse,
+                    cancellationToken);
 
-                await transaction.CommitAsync();
-                
-                await botClient.SendMessage(
-                    chatId,
-                    $"✅ Успешно списано {maxBonus} бонусов\n" +
-                    $"💳 К оплате: {purchaseAmount - maxBonus} руб.",
-                    cancellationToken: cancellationToken);
+                await transaction.CommitAsync(cancellationToken);
+
+                // 6. Отправляем подтверждение пользователю
+                await SendSuccessMessage(botClient, chatId,
+                    $"✅ Успешно списано {bonusCalculation.BonusToUse} бонусов\n" +
+                    $"💳 К оплате: {purchaseAmount - bonusCalculation.BonusToUse} руб.\n" +
+                    $"💰 Новый баланс: {newBalance} бонусов",
+                    cancellationToken);
             }
             catch (Exception ex)
             {
-                try
-                {
-                    if (transaction != null)
-                        await transaction.RollbackAsync(CancellationToken.None);
-                }
-                catch { }
-                
-                await botClient.SendMessage(
-                    chatId,
+                await TryRollback(transaction);
+                await SendErrorMessage(botClient, chatId,
                     $"❌ Ошибка при обработке платежа: {ex.Message}",
-                    cancellationToken: cancellationToken);
+                    cancellationToken);
+
+                // Логируем полную ошибку для диагностики
+                Console.WriteLine($"Payment error: {ex}");
             }
+        }
+
+        // Вспомогательные методы
+
+        private record BonusCalculationResult(
+            bool CanUseBonus,
+            int BonusToUse,
+            int MinPurchaseAmount);
+
+        private record UserRecord(
+            long Id,
+            int BonusBalance);
+            
+        private record UserInfo(long Id, string Phone, int Balance);
+
+        private static BonusCalculationResult CalculateAvailableBonus(
+            int currentBalance,
+            int purchaseAmount)
+        {
+            // Можно использовать до 50% от суммы покупки
+            int maxPossibleBonus = purchaseAmount / 2;
+            int actualBonus = Math.Min(currentBalance, maxPossibleBonus);
+
+            // Минимальная сумма покупки для использования бонусов
+            int minPurchaseForBonus = (currentBalance * 2) + 1;
+
+            return new BonusCalculationResult(
+                CanUseBonus: actualBonus > 0,
+                BonusToUse: actualBonus,
+                MinPurchaseAmount: minPurchaseForBonus
+            );
+        }
+
+        private static async Task<UserRecord?> GetUserWithLock(
+            SqliteConnection conn,
+            long chatId,
+            SqliteTransaction transaction,
+            CancellationToken ct)
+        {
+            const string query = @"
+                SELECT id, BonusBalance 
+                FROM Users 
+                WHERE ChatId = @chatId
+                LIMIT 1";
+            
+            await using var cmd = new SqliteCommand(query, conn, transaction);
+            cmd.Parameters.AddWithValue("@chatId", chatId);
+            
+            await using var reader = await cmd.ExecuteReaderAsync(ct);
+            if (await reader.ReadAsync(ct))
+            {
+                return new UserRecord(
+                    reader.GetInt64(0),
+                    reader.GetInt32(1));
+            }
+            
+            return null;
+        }
+
+        private static async Task<int> UpdateUserBalance(
+            SqliteConnection conn,
+            SqliteTransaction transaction,
+            long userId,
+            int bonusToDeduct,
+            CancellationToken ct)
+        {
+            const string query = @"
+                UPDATE Users 
+                SET BonusBalance = BonusBalance - @bonus 
+                WHERE id = @userId
+                RETURNING BonusBalance";
+            
+            await using var cmd = new SqliteCommand(query, conn, transaction);
+            cmd.Parameters.AddWithValue("@bonus", bonusToDeduct);
+            cmd.Parameters.AddWithValue("@userId", userId);
+            
+            return Convert.ToInt32(await cmd.ExecuteScalarAsync(ct));
+        }
+
+        private static async Task RecordTransaction(
+            SqliteConnection conn,
+            SqliteTransaction transaction,
+            long userId,
+            int amount,
+            CancellationToken ct)
+        {
+            const string query = @"
+                INSERT INTO Transactions 
+                (UserId, Type, Amount, Date) 
+                VALUES (@userId, 'WriteOff', @amount, datetime('now'))";
+            
+            await using var cmd = new SqliteCommand(query, conn, transaction);
+            cmd.Parameters.AddWithValue("@userId", userId);
+            cmd.Parameters.AddWithValue("@amount", amount);
+            
+            await cmd.ExecuteNonQueryAsync(ct);
+        }
+
+        private static async Task TryRollback(SqliteTransaction? transaction)
+        {
+            try
+            {
+                if (transaction != null)
+                    await transaction.RollbackAsync();
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Rollback failed: {ex}");
+            }
+        }
+
+        private static Task SendErrorMessage(
+            ITelegramBotClient botClient,
+            long chatId,
+            string message,
+            CancellationToken ct)
+        {
+            return botClient.SendMessage(
+                chatId,
+                message,
+                cancellationToken: ct);
+        }
+
+        private static Task SendSuccessMessage(
+            ITelegramBotClient botClient,
+            long chatId,
+            string message,
+            CancellationToken ct)
+        {
+            return botClient.SendMessage(
+                chatId,
+                message,
+                cancellationToken: ct);
         }
     }
 }
